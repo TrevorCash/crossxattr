@@ -381,7 +381,7 @@ def to_files_mode(root_dir: str) -> None:
 
 
 def main() -> None:
-    root_dir = cwd
+    root_dir = os.getcwd()
     json_path = os.path.join(root_dir, ".xattr.json")
     if not os.path.exists(json_path):
         try:
