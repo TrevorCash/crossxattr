@@ -2,7 +2,7 @@
 """
 Cross-platform extended file attributes manager.
 
-Stores and restores extended file attributes (xattr) using .xattr.json files.
+Stores and restores extended file and directory attributes (xattr) using .xattr.json files.
 Supports Windows (NTFS extended attributes), macOS, and Linux.
 
 Usage:
@@ -10,11 +10,13 @@ Usage:
   python xattr_manager.py --mode=toFiles
 
 Modes:
-  fromFiles  Scan all files recursively and store their xattrs in .xattr.json files.
-  toFiles    Read .xattr.json files and restore xattrs to the files.
+  fromFiles  Scan all files and directories recursively and store their xattrs in .xattr.json files.
+  toFiles    Read .xattr.json files and restore xattrs to the files and directories.
 
+The script must be run from the directory where this script resides.
 JSON keys are canonical cross-platform names; the script translates them to/from
 platform-specific xattr names at runtime.
+Directory entries in JSON are suffixed with "/" to distinguish them from files.
 Requires Python 3.13+ for os.getxattr / os.setxattr support.
 """
 
@@ -169,7 +171,10 @@ def _remove_xattr(path: str, key: str) -> bool:
 
 def _find_closest_json(file_path: str, json_dirs: set[str]) -> str | None:
     """Find the closest ancestor directory containing a .xattr.json."""
-    dir_path = os.path.dirname(os.path.abspath(file_path))
+    if file_path.endswith("/"):
+        dir_path = os.path.dirname(os.path.abspath(file_path.rstrip("/")))
+    else:
+        dir_path = os.path.dirname(os.path.abspath(file_path))
     while True:
         if dir_path in json_dirs:
             return dir_path
@@ -180,31 +185,42 @@ def _find_closest_json(file_path: str, json_dirs: set[str]) -> str | None:
     return None
 
 
-def _scan_tree(root_dir: str) -> tuple[dict[str, str], list[str]]:
+def _scan_tree(root_dir: str, traverse_hidden: bool = True) -> tuple[dict[str, str], list[str]]:
     """
-    Walk root_dir and return (json_dir_map, all_files).
+    Walk root_dir and return (json_dir_map, all_entries).
+    Uses os.scandir() for speed.
     json_dir_map: {directory_path: .xattr.json path}
-    all_files: absolute paths of all regular files (excluding .xattr.json itself).
+    all_entries: absolute paths of all regular files and directories
+                 (excluding .xattr.json itself). Directory paths end with "/".
     """
     json_dirs: dict[str, str] = {}
-    all_files: list[str] = []
+    all_entries: list[str] = []
 
-    for dirpath, _dirnames, filenames in os.walk(root_dir, followlinks=False):
-        json_path = os.path.join(dirpath, ".xattr.json")
-        if os.path.isfile(json_path):
-            json_dirs[dirpath] = json_path
+    def _scan(dir_path: str) -> None:
+        try:
+            with os.scandir(dir_path) as it:
+                for entry in it:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name != ".xattr.json":
+                            all_entries.append(entry.path + "/")
+                        if not traverse_hidden and entry.name.startswith("."):
+                            continue
+                        _scan(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if entry.name == ".xattr.json":
+                            json_dirs[dir_path] = entry.path
+                        else:
+                            all_entries.append(entry.path)
+        except PermissionError:
+            pass
 
-        for filename in filenames:
-            if filename == ".xattr.json":
-                continue
-            file_path = os.path.join(dirpath, filename)
-            if os.path.isfile(file_path):
-                all_files.append(file_path)
-
-    return json_dirs, all_files
+    _scan(root_dir)
+    return json_dirs, all_entries
 
 
-def from_files_mode(root_dir: str) -> None:
+def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
     if not _has_xattr_support():
         print(
             "Error: Extended attributes are not supported on this platform "
@@ -213,25 +229,25 @@ def from_files_mode(root_dir: str) -> None:
         )
         sys.exit(1)
 
-    json_dirs, all_files = _scan_tree(root_dir)
+    json_dirs, all_entries = _scan_tree(root_dir, traverse_hidden=traverse_hidden)
     json_dir_set = set(json_dirs.keys())
 
-    file_to_json_dir: dict[str, str] = {}
-    for file_path in all_files:
-        closest = _find_closest_json(file_path, json_dir_set)
+    entry_to_json_dir: dict[str, str] = {}
+    for entry_path in all_entries:
+        closest = _find_closest_json(entry_path, json_dir_set)
         if closest is None:
             closest = root_dir
-        file_to_json_dir[file_path] = closest
+        entry_to_json_dir[entry_path] = closest
 
-    for json_dir in file_to_json_dir.values():
+    for json_dir in entry_to_json_dir.values():
         if json_dir not in json_dirs:
             json_dirs[json_dir] = os.path.join(json_dir, ".xattr.json")
 
-    json_to_files: dict[str, list[str]] = {}
-    for file_path, json_dir in file_to_json_dir.items():
-        json_to_files.setdefault(json_dir, []).append(file_path)
+    json_to_entries: dict[str, list[str]] = {}
+    for entry_path, json_dir in entry_to_json_dir.items():
+        json_to_entries.setdefault(json_dir, []).append(entry_path)
 
-    for json_dir, files in json_to_files.items():
+    for json_dir, entries in json_to_entries.items():
         json_path = json_dirs[json_dir]
         data: dict[str, Any] = {}
         if os.path.exists(json_path):
@@ -241,41 +257,45 @@ def from_files_mode(root_dir: str) -> None:
             except (json.JSONDecodeError, IOError):
                 data = {}
 
-        files_set = set(files)
+        entries_set = set(entries)
 
         keys_to_remove = []
-        for file_key in list(data.keys()):
-            file_abs = os.path.join(json_dir, file_key)
-            if file_abs not in files_set:
-                closest = _find_closest_json(file_abs, json_dir_set)
+        for entry_key in list(data.keys()):
+            entry_abs = os.path.join(json_dir, entry_key)
+            if entry_abs not in entries_set:
+                closest = _find_closest_json(entry_abs, json_dir_set)
                 if closest is not None and closest != json_dir:
-                    keys_to_remove.append(file_key)
+                    keys_to_remove.append(entry_key)
 
         for key in keys_to_remove:
             del data[key]
 
-        for file_path in files:
-            rel_path = os.path.relpath(file_path, json_dir)
+        for entry_path in entries:
+            is_dir = entry_path.endswith("/")
+            rel_path = os.path.relpath(entry_path, json_dir)
+            if is_dir:
+                rel_path = rel_path.rstrip("/") + "/"
             if rel_path.startswith(".."):
                 continue
 
-            xattr_keys = _list_xattrs(file_path)
+            actual_path = entry_path.rstrip("/")
+            xattr_keys = _list_xattrs(actual_path)
             if not xattr_keys:
                 continue
 
-            file_entry: dict[str, Any] = {}
+            entry_data: dict[str, Any] = {}
             for key in xattr_keys:
-                value = _get_xattr(file_path, key)
+                value = _get_xattr(actual_path, key)
                 if value is None:
                     continue
                 canonical = to_canonical(key)
                 try:
-                    file_entry[canonical] = {"text": _encode(value)}
+                    entry_data[canonical] = {"text": _encode(value)}
                 except UnicodeDecodeError:
-                    file_entry[canonical] = {"raw": _encode_raw(value)}
+                    entry_data[canonical] = {"raw": _encode_raw(value)}
 
-            if file_entry:
-                data[rel_path] = file_entry
+            if entry_data:
+                data[rel_path] = entry_data
 
         try:
             os.makedirs(json_dir, exist_ok=True)
@@ -286,11 +306,11 @@ def from_files_mode(root_dir: str) -> None:
             print(f"Error writing {json_path}: {e}", file=sys.stderr)
 
     print(
-        f"Processed {len(all_files)} files across {len(json_dirs)} .xattr.json files."
+        f"Processed {len(all_entries)} entries across {len(json_dirs)} .xattr.json files."
     )
 
 
-def to_files_mode(root_dir: str) -> None:
+def to_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
     if not _has_xattr_support():
         print(
             "Error: Extended attributes are not supported on this platform "
@@ -299,26 +319,26 @@ def to_files_mode(root_dir: str) -> None:
         )
         sys.exit(1)
 
-    json_dirs, all_files = _scan_tree(root_dir)
+    json_dirs, all_entries = _scan_tree(root_dir, traverse_hidden=traverse_hidden)
     json_dir_set = set(json_dirs.keys())
 
-    file_to_json_dir: dict[str, str] = {}
-    for file_path in all_files:
-        closest = _find_closest_json(file_path, json_dir_set)
+    entry_to_json_dir: dict[str, str] = {}
+    for entry_path in all_entries:
+        closest = _find_closest_json(entry_path, json_dir_set)
         if closest is None:
             continue
         if closest not in json_dirs:
             continue
-        file_to_json_dir[file_path] = closest
+        entry_to_json_dir[entry_path] = closest
 
-    json_to_files: dict[str, list[str]] = {}
-    for file_path, json_dir in file_to_json_dir.items():
-        json_to_files.setdefault(json_dir, []).append(file_path)
+    json_to_entries: dict[str, list[str]] = {}
+    for entry_path, json_dir in entry_to_json_dir.items():
+        json_to_entries.setdefault(json_dir, []).append(entry_path)
 
     success_count = 0
     error_count = 0
 
-    for json_dir, files in json_to_files.items():
+    for json_dir, entries in json_to_entries.items():
         json_path = json_dirs[json_dir]
         if not os.path.exists(json_path):
             continue
@@ -330,11 +350,15 @@ def to_files_mode(root_dir: str) -> None:
             print(f"Error reading {json_path}: {e}", file=sys.stderr)
             continue
 
-        for file_path in files:
-            rel_path = os.path.relpath(file_path, json_dir)
+        for entry_path in entries:
+            is_dir = entry_path.endswith("/")
+            rel_path = os.path.relpath(entry_path, json_dir)
+            if is_dir:
+                rel_path = rel_path.rstrip("/") + "/"
             if rel_path not in data:
                 continue
 
+            actual_path = entry_path.rstrip("/")
             file_data = data[rel_path]
             if not isinstance(file_data, dict):
                 continue
@@ -345,35 +369,35 @@ def to_files_mode(root_dir: str) -> None:
                 if "text" in entry:
                     try:
                         value = _decode(entry["text"])
-                        if _set_xattr(file_path, os_key, value):
+                        if _set_xattr(actual_path, os_key, value):
                             success_count += 1
                         else:
                             error_count += 1
                             print(
-                                f"Failed to set xattr '{os_key}' on {file_path}",
+                                f"Failed to set xattr '{os_key}' on {actual_path}",
                                 file=sys.stderr,
                             )
                     except Exception as e:
                         error_count += 1
                         print(
-                            f"Error setting xattr '{os_key}' on {file_path}: {e}",
+                            f"Error setting xattr '{os_key}' on {actual_path}: {e}",
                             file=sys.stderr,
                         )
                 if "raw" in entry:
                     try:
                         value = _decode_raw(entry["raw"])
-                        if _set_xattr(file_path, os_key, value):
+                        if _set_xattr(actual_path, os_key, value):
                             success_count += 1
                         else:
                             error_count += 1
                             print(
-                                f"Failed to set xattr '{os_key}' on {file_path}",
+                                f"Failed to set xattr '{os_key}' on {actual_path}",
                                 file=sys.stderr,
                             )
                     except Exception as e:
                         error_count += 1
                         print(
-                            f"Error setting xattr '{os_key}' on {file_path}: {e}",
+                            f"Error setting xattr '{os_key}' on {actual_path}: {e}",
                             file=sys.stderr,
                         )
 
@@ -401,6 +425,12 @@ def main() -> None:
         required=True,
         help="Operation mode: toFiles (restore xattrs from JSON) or fromFiles (scan and update JSON)",
     )
+    parser.add_argument(
+        "--traverseHiddenDirs",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="Whether to traverse hidden directories (default: true)",
+    )
 
     args = parser.parse_args()
 
@@ -409,9 +439,9 @@ def main() -> None:
         sys.exit(1)
 
     if args.mode == "fromFiles":
-        from_files_mode(root_dir)
+        from_files_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
     elif args.mode == "toFiles":
-        to_files_mode(root_dir)
+        to_files_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
 
 
 if __name__ == "__main__":
