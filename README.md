@@ -1,4 +1,4 @@
-Cross-platform extended file attributes manager.
+#Cross-platform extended file attributes manager.
 
 Stores and restores extended file and directory attributes (xattr) using .xattr.json files.
 Supports Windows, macOS, and Linux.  Aim to support all extended attribute formats.
@@ -14,13 +14,13 @@ If .xattr.json files are further into the directory structure - attributes will 
 .xattr.json files are meant to be store the attributes and can be tracked in projects (git repos etc.)
 
 
-Usage:
+#Usage:
   
  python crossxattr.py --mode=fromFiles
   
  python crossxattr.py --mode=toFiles
 
-Modes:
+#Modes:
   fromFiles  Scan all files and directories recursively and store their xattrs in .xattr.json files.
   toFiles    Read .xattr.json files and restore xattrs to the files and directories.
 
