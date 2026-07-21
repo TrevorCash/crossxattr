@@ -3,7 +3,18 @@
 Cross-platform extended file attributes manager.
 
 Stores and restores extended file and directory attributes (xattr) using .xattr.json files.
-Supports Windows (NTFS extended attributes), macOS, and Linux.
+Supports Windows, macOS, and Linux.  Aim to support all extended attribute formats.
+
+Tested So Far: 
+[KDE user.xdg.comment, user.xdg.tags]
+
+Native attributes for a project/directory are stored in a generic json hidden file. (.xattr.json)
+
+Running the script will recurse downwards and add all attributes to the .xattr.json where the script was called.
+If .xattr.json files are further into the directory structure - attributes will be added to that (closer to the file) rather than the root.xattr.json
+
+.xattr.json files are meant to be store the attributes and can be tracked in projects (git repos etc.)
+
 
 Usage:
   python xattr_manager.py --mode=fromFiles
