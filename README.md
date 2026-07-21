@@ -15,9 +15,10 @@ If .xattr.json files are further into the directory structure - attributes will 
 
 
 Usage:
-  python crossxattr.py --mode=fromFiles
   
-  python crossxattr.py --mode=toFiles
+ python crossxattr.py --mode=fromFiles
+  
+ python crossxattr.py --mode=toFiles
 
 Modes:
   fromFiles  Scan all files and directories recursively and store their xattrs in .xattr.json files.
