@@ -6,8 +6,8 @@ Stores and restores extended file and directory attributes (xattr) using .xattr.
 Supports Windows (NTFS extended attributes), macOS, and Linux.
 
 Usage:
-  python xattr_manager.py --mode=fromFiles
-  python xattr_manager.py --mode=toFiles
+  python crossxattr.py --mode=fromFiles
+  python crossxattr.py --mode=toFiles
 
 Modes:
   fromFiles  Scan all files and directories recursively and store their xattrs in .xattr.json files.
@@ -17,6 +17,8 @@ The script must be run from the directory where this script resides.
 JSON keys are canonical cross-platform names; the script translates them to/from
 platform-specific xattr names at runtime.
 Directory entries in JSON are suffixed with "/" to distinguish them from files.
+When in fromFiles mode, files inside a git repository automatically have their
+attributes stored in a .xattr.json at the git repository root.
 Requires Python 3.13+ for os.getxattr / os.setxattr support.
 """
 
@@ -169,14 +171,40 @@ def _remove_xattr(path: str, key: str) -> bool:
         return False
 
 
-def _find_closest_json(file_path: str, json_dirs: set[str]) -> str | None:
-    """Find the closest ancestor directory containing a .xattr.json."""
-    if file_path.endswith("/"):
-        dir_path = os.path.dirname(os.path.abspath(file_path.rstrip("/")))
+def _find_closest_json_for_entry(entry_path: str, json_dirs: set[str]) -> str | None:
+    """Find the closest .xattr.json for an entry, respecting git repo boundaries."""
+    git_root = _find_git_root(entry_path)
+
+    if entry_path.endswith("/"):
+        dir_path = os.path.abspath(entry_path.rstrip("/"))
     else:
-        dir_path = os.path.dirname(os.path.abspath(file_path))
+        dir_path = os.path.dirname(os.path.abspath(entry_path))
+
     while True:
         if dir_path in json_dirs:
+            return dir_path
+        if git_root is not None and dir_path == git_root:
+            return git_root
+        parent = os.path.dirname(dir_path)
+        if parent == dir_path:
+            break
+        if git_root is not None and not (parent == git_root or parent.startswith(git_root + os.sep)):
+            break
+        dir_path = parent
+
+    return None
+
+
+def _find_git_root(path: str) -> str | None:
+    """Find the root of the nearest git repository containing the given path."""
+    actual_path = path.rstrip("/")
+    if os.path.isdir(actual_path):
+        dir_path = actual_path
+    else:
+        dir_path = os.path.dirname(actual_path)
+    while True:
+        git_path = os.path.join(dir_path, ".git")
+        if os.path.isdir(git_path) or os.path.isfile(git_path):
             return dir_path
         parent = os.path.dirname(dir_path)
         if parent == dir_path:
@@ -234,7 +262,7 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
 
     entry_to_json_dir: dict[str, str] = {}
     for entry_path in all_entries:
-        closest = _find_closest_json(entry_path, json_dir_set)
+        closest = _find_closest_json_for_entry(entry_path, json_dir_set)
         if closest is None:
             closest = root_dir
         entry_to_json_dir[entry_path] = closest
@@ -242,6 +270,8 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
     for json_dir in entry_to_json_dir.values():
         if json_dir not in json_dirs:
             json_dirs[json_dir] = os.path.join(json_dir, ".xattr.json")
+
+    json_dir_set = set(json_dirs.keys())
 
     json_to_entries: dict[str, list[str]] = {}
     for entry_path, json_dir in entry_to_json_dir.items():
@@ -263,7 +293,7 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
         for entry_key in list(data.keys()):
             entry_abs = os.path.join(json_dir, entry_key)
             if entry_abs not in entries_set:
-                closest = _find_closest_json(entry_abs, json_dir_set)
+                closest = _find_closest_json_for_entry(entry_abs, json_dir_set)
                 if closest is not None and closest != json_dir:
                     keys_to_remove.append(entry_key)
 
@@ -324,7 +354,7 @@ def to_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
 
     entry_to_json_dir: dict[str, str] = {}
     for entry_path in all_entries:
-        closest = _find_closest_json(entry_path, json_dir_set)
+        closest = _find_closest_json_for_entry(entry_path, json_dir_set)
         if closest is None:
             continue
         if closest not in json_dirs:
