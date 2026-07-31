@@ -462,15 +462,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["toFiles", "fromFiles"],
+        choices=["jsonToFiles", "filesToJson"],
         required=True,
-        help="Operation mode: toFiles (restore xattrs from JSON) or fromFiles (scan and update JSON)",
+        help="Operation mode: jsonToFiles (restore xattrs from JSON) or filesToJson (scan and update JSON)",
     )
     parser.add_argument(
         "--traverseHiddenDirs",
         type=lambda x: x.lower() == "true",
-        default=True,
-        help="Whether to traverse hidden directories (default: true)",
+        default=False,
+        help="Whether to traverse hidden directories (default: false)",
     )
 
     args = parser.parse_args()
@@ -479,9 +479,9 @@ def main() -> None:
         print(f"Error: {root_dir} is not a directory.", file=sys.stderr)
         sys.exit(1)
 
-    if args.mode == "fromFiles":
+    if args.mode == "filesToJson":
         from_files_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
-    elif args.mode == "toFiles":
+    elif args.mode == "jsonToFiles":
         to_files_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
 
 

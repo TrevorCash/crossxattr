@@ -18,13 +18,13 @@ If .xattr.json files are further into the directory structure - attributes will 
 **Usage:**
   
 
-    python crossxattr.py --mode=fromFiles
+    python crossxattr.py --mode=filesToJson
 
-    python crossxattr.py --mode=toFiles
+    python crossxattr.py --mode=jsonToFiles
 
 **Modes:**
-  fromFiles  Scan all files and directories recursively and store their xattrs in .xattr.json files.
-  toFiles    Read .xattr.json files and restore xattrs to the files and directories.
+  filesToJson  Scan all files and directories recursively and store their xattrs in .xattr.json files.
+  jsonToFiles  Read .xattr.json files and restore xattrs to the files and directories.
 
 The script must be run from the directory where this script resides.
 JSON keys are canonical cross-platform names; the script translates them to/from
