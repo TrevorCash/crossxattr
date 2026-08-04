@@ -4,6 +4,8 @@
 Stores and restores extended file and directory attributes (xattr) using .xattr.json files.
 Supports Windows, macOS, and Linux.  Aim to support all extended attribute formats.
 
+Tags saved on one OS/Plaform are converted to the other OS/Platform. when restoring to native attributes.
+
 Tested So Far: 
 [KDE user.xdg.comment, user.xdg.tags]
 
