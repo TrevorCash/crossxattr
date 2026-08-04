@@ -17,18 +17,22 @@ If .xattr.json files are further into the directory structure - attributes will 
 
 
 Usage:
-  python crossxattr.py --mode=fromFiles
-  python crossxattr.py --mode=toFiles
+  python crossxattr.py --mode=filesToJson
+  python crossxattr.py --mode=jsonToFiles
+  python crossxattr.py --mode=flatten
 
 Modes:
-  fromFiles  Scan all files and directories recursively and store their xattrs in .xattr.json files.
-  toFiles    Read .xattr.json files and restore xattrs to the files and directories.
+  filesToJson  Scan all files and directories recursively and store their xattrs in .xattr.json files.
+  jsonToFiles  Read .xattr.json files and restore xattrs to the files and directories.
+  flatten      Propagate directory attributes from the filesystem to all descendant files and directories.
 
 The script must be run from the directory where this script resides.
 JSON keys are canonical cross-platform names; the script translates them to/from
 platform-specific xattr names at runtime.
 Directory entries in JSON are suffixed with "/" to distinguish them from files.
-When in fromFiles mode, files inside a git repository automatically have their
+List-type attributes (e.g., tags) are stored as comma-separated values in JSON and
+converted to newline-separated bytes when applied to the filesystem.
+When in filesToJson mode, files inside a git repository automatically have their
 attributes stored in a .xattr.json at the git repository root.
 Requires Python 3.13+ for os.getxattr / os.setxattr support.
 """
@@ -259,6 +263,32 @@ def _scan_tree(root_dir: str, traverse_hidden: bool = True) -> tuple[dict[str, s
     return json_dirs, all_entries
 
 
+def _is_list_key(canonical: str) -> bool:
+    return canonical == "tags"
+
+
+def _list_separator(canonical: str) -> str:
+    return {"tags": ","}.get(canonical, "\n")
+
+
+def _list_to_items(raw: bytes, separator: str) -> list[str]:
+    text = raw.decode("utf-8")
+    return [item for item in text.split(separator) if item]
+
+
+def _items_to_list(items: list[str], separator: str) -> bytes:
+    return separator.join(items).encode("utf-8")
+
+
+def _merge_list_value(dir_value: bytes, existing_value: bytes | None, separator: str) -> bytes | None:
+    dir_items = _list_to_items(dir_value, separator)
+    existing_items = _list_to_items(existing_value, separator) if existing_value else []
+    merged = sorted(set(dir_items) | set(existing_items))
+    if merged == existing_items:
+        return None
+    return _items_to_list(merged, separator)
+
+
 def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
     if not _has_xattr_support():
         print(
@@ -268,75 +298,78 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
         )
         sys.exit(1)
 
-    json_dirs, all_entries = _scan_tree(root_dir, traverse_hidden=traverse_hidden)
-    json_dir_set = set(json_dirs.keys())
+    json_dirs, _ = _scan_tree(root_dir, traverse_hidden=traverse_hidden)
 
-    entry_to_json_dir: dict[str, str] = {}
-    for entry_path in all_entries:
-        closest = _find_closest_json_for_entry(entry_path, json_dir_set)
-        if closest is None:
-            closest = root_dir
-        entry_to_json_dir[entry_path] = closest
-
-    for json_dir in entry_to_json_dir.values():
-        if json_dir not in json_dirs:
-            json_dirs[json_dir] = os.path.join(json_dir, ".xattr.json")
+    if not json_dirs:
+        json_dirs = {root_dir: os.path.join(root_dir, ".xattr.json")}
 
     json_dir_set = set(json_dirs.keys())
 
-    json_to_entries: dict[str, list[str]] = {}
-    for entry_path, json_dir in entry_to_json_dir.items():
-        json_to_entries.setdefault(json_dir, []).append(entry_path)
-
-    for json_dir, entries in json_to_entries.items():
+    for json_dir in sorted(json_dirs.keys(), key=lambda p: p.count(os.sep)):
         json_path = json_dirs[json_dir]
         data: dict[str, Any] = {}
-        if os.path.exists(json_path):
+
+        json_dir_abs = os.path.abspath(json_dir)
+
+        def _walk(dir_path: str) -> None:
             try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except (json.JSONDecodeError, IOError):
-                data = {}
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        if entry.is_symlink():
+                            continue
+                        if entry.name == ".xattr.json":
+                            continue
+                        if not traverse_hidden and entry.name.startswith("."):
+                            continue
 
-        entries_set = set(entries)
+                        actual_path = entry.path
+                        xattr_keys = _list_xattrs(actual_path)
+                        if not xattr_keys:
+                            if entry.is_dir(follow_symlinks=False):
+                                entry_abs = os.path.abspath(entry.path)
+                                if entry_abs not in json_dir_set:
+                                    _walk(entry.path)
+                            continue
 
-        keys_to_remove = []
-        for entry_key in list(data.keys()):
-            entry_abs = os.path.join(json_dir, entry_key)
-            if entry_abs not in entries_set:
-                closest = _find_closest_json_for_entry(entry_abs, json_dir_set)
-                if closest is not None and closest != json_dir:
-                    keys_to_remove.append(entry_key)
+                        rel_path = os.path.relpath(actual_path, json_dir).replace("\\", "/")
+                        if entry.is_dir(follow_symlinks=False):
+                            rel_path = rel_path + "/"
 
-        for key in keys_to_remove:
-            del data[key]
+                        entry_abs = os.path.abspath(actual_path)
+                        if not entry_abs.startswith(json_dir_abs + os.sep) and entry_abs != json_dir_abs:
+                            if entry.is_dir(follow_symlinks=False):
+                                _walk(entry.path)
+                            continue
 
-        for entry_path in entries:
-            is_dir = entry_path.endswith("/")
-            rel_path = os.path.relpath(entry_path, json_dir)
-            if is_dir:
-                rel_path = rel_path.rstrip("/") + "/"
-            if rel_path.startswith(".."):
-                continue
+                        entry_data: dict[str, Any] = {}
+                        for key in xattr_keys:
+                            value = _get_xattr(actual_path, key)
+                            if value is None:
+                                continue
+                            canonical = to_canonical(key)
+                            try:
+                                text_value = _encode(value)
+                            except UnicodeDecodeError:
+                                entry_data[canonical] = {"raw": _encode_raw(value)}
+                                continue
 
-            actual_path = entry_path.rstrip("/")
-            xattr_keys = _list_xattrs(actual_path)
-            if not xattr_keys:
-                continue
+                            if _is_list_key(canonical):
+                                separator = _list_separator(canonical)
+                                entry_data[canonical] = _list_to_items(value, separator)
+                            else:
+                                entry_data[canonical] = {"text": text_value}
 
-            entry_data: dict[str, Any] = {}
-            for key in xattr_keys:
-                value = _get_xattr(actual_path, key)
-                if value is None:
-                    continue
-                canonical = to_canonical(key)
-                try:
-                    entry_data[canonical] = {"text": _encode(value)}
-                except UnicodeDecodeError:
-                    entry_data[canonical] = {"raw": _encode_raw(value)}
+                        if entry_data:
+                            data[rel_path] = entry_data
 
-            if entry_data:
-                data[rel_path] = entry_data
+                        if entry.is_dir(follow_symlinks=False):
+                            entry_abs = os.path.abspath(entry.path)
+                            if entry_abs not in json_dir_set:
+                                _walk(entry.path)
+            except PermissionError:
+                pass
+
+        _walk(json_dir)
 
         try:
             os.makedirs(json_dir, exist_ok=True)
@@ -347,7 +380,7 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
             print(f"Error writing {json_path}: {e}", file=sys.stderr)
 
     print(
-        f"Processed {len(all_entries)} entries across {len(json_dirs)} .xattr.json files."
+        f"Processed entries across {len(json_dirs)} .xattr.json files."
     )
 
 
@@ -404,12 +437,11 @@ def to_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
             if not isinstance(file_data, dict):
                 continue
             for canonical, entry in file_data.items():
-                if not isinstance(entry, dict):
-                    continue
                 os_key = from_canonical(canonical)
-                if "text" in entry:
+                separator = _list_separator(canonical)
+                if isinstance(entry, list):
                     try:
-                        value = _decode(entry["text"])
+                        value = _items_to_list(entry, separator)
                         if _set_xattr(actual_path, os_key, value):
                             success_count += 1
                         else:
@@ -424,47 +456,202 @@ def to_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
                             f"Error setting xattr '{os_key}' on {actual_path}: {e}",
                             file=sys.stderr,
                         )
-                if "raw" in entry:
-                    try:
-                        value = _decode_raw(entry["raw"])
-                        if _set_xattr(actual_path, os_key, value):
-                            success_count += 1
-                        else:
+                elif isinstance(entry, dict):
+                    if "text" in entry:
+                        try:
+                            text_value = entry["text"]
+                            if _is_list_key(canonical) and isinstance(text_value, str):
+                                value = _items_to_list([text_value], separator)
+                            else:
+                                value = _decode(text_value)
+                            if _set_xattr(actual_path, os_key, value):
+                                success_count += 1
+                            else:
+                                error_count += 1
+                                print(
+                                    f"Failed to set xattr '{os_key}' on {actual_path}",
+                                    file=sys.stderr,
+                                )
+                        except Exception as e:
                             error_count += 1
                             print(
-                                f"Failed to set xattr '{os_key}' on {actual_path}",
+                                f"Error setting xattr '{os_key}' on {actual_path}: {e}",
                                 file=sys.stderr,
                             )
-                    except Exception as e:
-                        error_count += 1
-                        print(
-                            f"Error setting xattr '{os_key}' on {actual_path}: {e}",
-                            file=sys.stderr,
-                        )
+                    if "raw" in entry:
+                        try:
+                            value = _decode_raw(entry["raw"])
+                            if _set_xattr(actual_path, os_key, value):
+                                success_count += 1
+                            else:
+                                error_count += 1
+                                print(
+                                    f"Failed to set xattr '{os_key}' on {actual_path}",
+                                    file=sys.stderr,
+                                )
+                        except Exception as e:
+                            error_count += 1
+                            print(
+                                f"Error setting xattr '{os_key}' on {actual_path}: {e}",
+                                file=sys.stderr,
+                            )
 
     print(f"Set {success_count} extended attributes ({error_count} errors).")
 
 
+def flatten_mode(root_dir: str, traverse_hidden: bool = True) -> None:
+    if not _has_xattr_support():
+        print(
+            "Error: Extended attributes are not supported on this platform "
+            "(requires Python 3.13+).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    dirs_with_attrs: dict[str, dict[str, Any]] = {}
+
+    for dir_path, dir_names, file_names in os.walk(root_dir, followlinks=False):
+        if not traverse_hidden:
+            dir_names[:] = [d for d in dir_names if not d.startswith(".")]
+
+        if dir_path == root_dir and os.path.basename(dir_path).startswith("."):
+            continue
+
+        xattr_keys = _list_xattrs(dir_path)
+        if not xattr_keys:
+            continue
+
+        attrs: dict[str, Any] = {}
+        for key in xattr_keys:
+            value = _get_xattr(dir_path, key)
+            if value is None:
+                continue
+            canonical = to_canonical(key)
+            try:
+                text_value = _encode(value)
+            except UnicodeDecodeError:
+                attrs[canonical] = {"raw": _encode_raw(value)}
+                continue
+
+            if _is_list_key(canonical):
+                separator = _list_separator(canonical)
+                attrs[canonical] = _list_to_items(value, separator)
+            else:
+                attrs[canonical] = {"text": text_value}
+
+        if attrs:
+            dirs_with_attrs[dir_path] = attrs
+
+    if not dirs_with_attrs:
+        print("No directory attributes found to flatten.")
+        return
+
+    affected_paths: set[str] = set()
+    affected = 0
+    attrs_set = 0
+
+    for dir_path, attrs in sorted(dirs_with_attrs.items(), key=lambda x: x[0].count(os.sep)):
+        if not attrs:
+            continue
+
+        for root, dirs, files in os.walk(dir_path, followlinks=False):
+            if not traverse_hidden:
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+            for name in files:
+                if name == ".xattr.json":
+                    continue
+                entry_path = os.path.join(root, name)
+                new_count = _count_new_attrs(entry_path, attrs)
+                if new_count > 0:
+                    _apply_missing_attrs(entry_path, attrs)
+                    if entry_path not in affected_paths:
+                        affected_paths.add(entry_path)
+                        affected += 1
+                    attrs_set += new_count
+
+            for name in dirs:
+                if name == ".xattr.json":
+                    continue
+                entry_path = os.path.join(root, name)
+                new_count = _count_new_attrs(entry_path, attrs)
+                if new_count > 0:
+                    _apply_missing_attrs(entry_path, attrs)
+                    if entry_path not in affected_paths:
+                        affected_paths.add(entry_path)
+                        affected += 1
+                    attrs_set += new_count
+
+    print(f"Flattened attributes to {affected} entries, set {attrs_set} attributes.")
+
+
+def _apply_missing_attrs(path: str, attrs: dict[str, Any]) -> None:
+    existing_xattrs = {key: _get_xattr(path, key) for key in _list_xattrs(path)}
+    for canonical, entry in attrs.items():
+        os_key = from_canonical(canonical)
+        existing_value = existing_xattrs.get(os_key)
+        separator = _list_separator(canonical)
+        if existing_value is not None:
+            if _is_list_key(canonical):
+                if isinstance(entry, list):
+                    new_bytes = _items_to_list(entry, separator)
+                    merged = _merge_list_value(new_bytes, existing_value, separator)
+                    if merged is None:
+                        continue
+                    _set_xattr(path, os_key, merged)
+                elif "raw" in entry:
+                    merged = _merge_list_value(_decode_raw(entry["raw"]), existing_value, separator)
+                    if merged is None:
+                        continue
+                    _set_xattr(path, os_key, merged)
+                continue
+            print(
+                f"Could not apply '{os_key}' to '{path}' - attribute already exists and is not a list-type.",
+                file=sys.stderr,
+            )
+            continue
+        if isinstance(entry, list):
+            _set_xattr(path, os_key, _items_to_list(entry, separator))
+        elif "text" in entry:
+            _set_xattr(path, os_key, _decode(entry["text"]))
+        if "raw" in entry:
+            _set_xattr(path, os_key, _decode_raw(entry["raw"]))
+
+
+def _count_new_attrs(path: str, attrs: dict[str, Any]) -> int:
+    existing_xattrs = {key: _get_xattr(path, key) for key in _list_xattrs(path)}
+    count = 0
+    for canonical, entry in attrs.items():
+        os_key = from_canonical(canonical)
+        existing_value = existing_xattrs.get(os_key)
+        separator = _list_separator(canonical)
+        if existing_value is None:
+            count += 1
+            continue
+        if _is_list_key(canonical):
+            if isinstance(entry, list):
+                new_bytes = _items_to_list(entry, separator)
+                merged = _merge_list_value(new_bytes, existing_value, separator)
+                if merged is not None:
+                    count += 1
+            elif "raw" in entry:
+                merged = _merge_list_value(_decode_raw(entry["raw"]), existing_value, separator)
+                if merged is not None:
+                    count += 1
+    return count
+
+
 def main() -> None:
     root_dir = os.getcwd()
-    json_path = os.path.join(root_dir, ".xattr.json")
-    if not os.path.exists(json_path):
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump({}, f)
-                f.write("\n")
-        except IOError as e:
-            print(f"Error creating {json_path}: {e}", file=sys.stderr)
-            sys.exit(1)
 
     parser = argparse.ArgumentParser(
         description="Cross-platform extended file attributes manager"
     )
     parser.add_argument(
         "--mode",
-        choices=["jsonToFiles", "filesToJson"],
+        choices=["jsonToFiles", "filesToJson", "flatten"],
         required=True,
-        help="Operation mode: jsonToFiles (restore xattrs from JSON) or filesToJson (scan and update JSON)",
+        help="Operation mode: jsonToFiles (restore xattrs from JSON), filesToJson (scan and update JSON), or flatten (propagate directory attributes to descendants)",
     )
     parser.add_argument(
         "--traverseHiddenDirs",
@@ -479,10 +666,23 @@ def main() -> None:
         print(f"Error: {root_dir} is not a directory.", file=sys.stderr)
         sys.exit(1)
 
+    if args.mode in ("filesToJson", "jsonToFiles"):
+        json_path = os.path.join(root_dir, ".xattr.json")
+        if not os.path.exists(json_path):
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump({}, f)
+                    f.write("\n")
+            except IOError as e:
+                print(f"Error creating {json_path}: {e}", file=sys.stderr)
+                sys.exit(1)
+
     if args.mode == "filesToJson":
         from_files_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
     elif args.mode == "jsonToFiles":
         to_files_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
+    elif args.mode == "flatten":
+        flatten_mode(root_dir, traverse_hidden=args.traverseHiddenDirs)
 
 
 if __name__ == "__main__":
