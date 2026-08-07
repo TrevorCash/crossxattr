@@ -15,6 +15,8 @@ If .xattr.json files are further into the directory structure - attributes will 
 
 .xattr.json files are meant to be store the attributes and can be tracked in projects (git repos etc.)
 
+Place an empty .xattr.skip file in a directory to exclude that directory and all descendants from scanning.
+
 
 Usage:
   python crossxattr.py --mode=filesToJson
@@ -240,6 +242,8 @@ def _scan_tree(root_dir: str, traverse_hidden: bool = True) -> tuple[dict[str, s
     all_entries: list[str] = []
 
     def _scan(dir_path: str) -> None:
+        if os.path.isfile(os.path.join(dir_path, ".xattr.skip")):
+            return
         try:
             with os.scandir(dir_path) as it:
                 for entry in it:
@@ -312,6 +316,8 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
         json_dir_abs = os.path.abspath(json_dir)
 
         def _walk(dir_path: str) -> None:
+            if os.path.isfile(os.path.join(dir_path, ".xattr.skip")):
+                return
             try:
                 with os.scandir(dir_path) as it:
                     for entry in it:
@@ -517,6 +523,10 @@ def flatten_mode(root_dir: str, traverse_hidden: bool = True) -> None:
         if dir_path == root_dir and os.path.basename(dir_path).startswith("."):
             continue
 
+        if os.path.isfile(os.path.join(dir_path, ".xattr.skip")):
+            dir_names[:] = []
+            continue
+
         xattr_keys = _list_xattrs(dir_path)
         if not xattr_keys:
             continue
@@ -558,22 +568,21 @@ def flatten_mode(root_dir: str, traverse_hidden: bool = True) -> None:
             if not traverse_hidden:
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
 
-            for name in files:
-                if name == ".xattr.json":
-                    continue
-                entry_path = os.path.join(root, name)
-                new_count = _count_new_attrs(entry_path, attrs)
-                if new_count > 0:
-                    _apply_missing_attrs(entry_path, attrs)
-                    if entry_path not in affected_paths:
-                        affected_paths.add(entry_path)
-                        affected += 1
-                    attrs_set += new_count
+            if os.path.isfile(os.path.join(root, ".xattr.skip")):
+                dirs[:] = []
+                entries = [root]
+            else:
+                entries = []
+                for name in files:
+                    if name == ".xattr.json":
+                        continue
+                    entries.append(os.path.join(root, name))
+                for name in dirs:
+                    if name == ".xattr.json":
+                        continue
+                    entries.append(os.path.join(root, name))
 
-            for name in dirs:
-                if name == ".xattr.json":
-                    continue
-                entry_path = os.path.join(root, name)
+            for entry_path in entries:
                 new_count = _count_new_attrs(entry_path, attrs)
                 if new_count > 0:
                     _apply_missing_attrs(entry_path, attrs)
