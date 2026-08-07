@@ -15,7 +15,7 @@ If .xattr.json files are further into the directory structure - attributes will 
 
 .xattr.json files are meant to be store the attributes and can be tracked in projects (git repos etc.)
 
-Place an empty .xattr.skip file in a directory to exclude that directory and all descendants from scanning.
+.xattr.skip files in a directory will exclude any files and directories beside it from being scanned or having attributes modified.
 
 
 Usage:
