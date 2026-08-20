@@ -28,7 +28,7 @@ Modes:
   jsonToFiles  Read .xattr.json files and restore xattrs to the files and directories.
   flatten      Propagate directory attributes from the filesystem to all descendant files and directories.
 
-The script must be run from the directory where this script resides.
+
 JSON keys are canonical cross-platform names; the script translates them to/from
 platform-specific xattr names at runtime.
 Directory entries in JSON are suffixed with "/" to distinguish them from files.
@@ -264,6 +264,7 @@ def _scan_tree(root_dir: str, traverse_hidden: bool = True) -> tuple[dict[str, s
             pass
 
     _scan(root_dir)
+    all_entries.append(root_dir + "/")
     return json_dirs, all_entries
 
 
@@ -314,6 +315,30 @@ def from_files_mode(root_dir: str, traverse_hidden: bool = True) -> None:
         data: dict[str, Any] = {}
 
         json_dir_abs = os.path.abspath(json_dir)
+
+        if not os.path.isfile(os.path.join(json_dir, ".xattr.skip")):
+            dir_xattr_keys = _list_xattrs(json_dir_abs)
+            if dir_xattr_keys:
+                dir_data: dict[str, Any] = {}
+                for key in dir_xattr_keys:
+                    value = _get_xattr(json_dir_abs, key)
+                    if value is None:
+                        continue
+                    canonical = to_canonical(key)
+                    try:
+                        text_value = _encode(value)
+                    except UnicodeDecodeError:
+                        dir_data[canonical] = {"raw": _encode_raw(value)}
+                        continue
+
+                    if _is_list_key(canonical):
+                        separator = _list_separator(canonical)
+                        dir_data[canonical] = _list_to_items(value, separator)
+                    else:
+                        dir_data[canonical] = {"text": text_value}
+
+                if dir_data:
+                    data["./"] = dir_data
 
         def _walk(dir_path: str) -> None:
             if os.path.isfile(os.path.join(dir_path, ".xattr.skip")):
